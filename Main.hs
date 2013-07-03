@@ -1,17 +1,119 @@
-{-# LANGUAGE TupleSections #-}
-import Control.Wire
-import Control.Wire.Trans.Simple
-import Control.Wire.Wire
-import Prelude hiding ((.), id)
-import Control.Monad.Identity
-import Text.Printf
+{-# LANGUAGE TupleSections, RankNTypes, Arrows, MultiWayIf, TemplateHaskell, FlexibleContexts, ImplicitParams, GeneralizedNewtypeDeriving #-}
+
+import Data.Vector.Unboxed hiding (modify)
+import Control.Lens
 import Data.Word
-import Data.Bits
-import Data.Vector.Unboxed.Mutable as V
+import Data.Int
+import Control.Monad.Writer
+import Control.Monad.State
+import Control.Applicative
+import Data.Maybe
 
 
+import qualified Data.Bits as B
+import Data.Bits.Lens
 
-type WireI a b = Wire () IO a b
+data MachineState = MachineState
+                  { _accumulator :: Word8
+                  , _xIndex      :: Word8
+                  , _yIndex      :: Word8
+                  , _pc          :: Word16
+                  , _sp          :: Word8
+                  , _status      :: Word8
+                  , _memoryVec   :: Vector Word8
+                  }
+makeLenses ''MachineState
+
+type ZeroPageAddress = Word8
+type Address = Word16
+type StatusBit = Word8
+
+type Cycles = Sum Int
+
+narrow :: Word16 -> Word8
+narrow = fromIntegral
+
+broaden :: Word8 -> Word16
+broaden = fromIntegral
+
+hi :: Lens' Word16 Word8
+hi f w = fmap (\v -> flip B.shiftL 8 (broaden v) B..|. (w B..&. 0x00FF))
+              (f $ narrow $ flip B.shiftR 8 $ w B..&. 0xFF00)
+
+lo :: Lens' Word16 Word8
+lo f w = fmap (\v -> broaden v B..|. (w B..&. 0xFF00) )
+              (f $ narrow $ w B..&. 0x00FF)
+
+
+delay :: (MonadWriter Cycles m) => Int -> a -> m a
+delay x a = tell (Sum x) >> return a
+
+wait ::  (MonadWriter Cycles m) => Int -> m ()
+wait = tell . Sum
+
+memory :: Address -> Lens' MachineState Word8
+memory a = singular (memoryVec . ix (fromIntegral a))
+
+-- assumption, two input lenses do not alias
+also :: Lens' a b -> Lens' a c -> Lens' a (b,c)
+also lab lac = lens (\s -> (s^.lab, s^.lac))
+                    (\s (b,c) -> s & lab .~ b & lac .~ c)
+
+memoryW :: Address -> Lens' MachineState Word16
+memoryW a = (memory a `also` memory (a+1)) . combine
+
+combine :: Iso' (Word8,Word8) Word16
+combine = iso (flip (set $ lo `also` hi) 0)
+               (view (lo `also` hi))
+
+
+readOperand' :: (MonadWriter Cycles m) => MemOperand -> MachineState -> m Word8
+readOperand' (Immediate v) s = delay 0 v
+readOperand' (ZeroPage  a) s = delay 1 (s^.memory (broaden a))
+readOperand' (Absolute  a) s = delay 2 (s^.memory a)
+readOperand' (ZPIndexedX a) s = delay 2 (s^.memory ( broaden $ s^.xIndex + a))
+readOperand' (ZPIndexedY a) s = delay 2 (s^.memory ( broaden $ s^.yIndex + a))
+readOperand' (IndexedX  a) s = let v = (s^.xIndex.to broaden + a)
+                                   c = v^.hi == a^.hi
+                                in delay (2 + if c then 1 else 0) (s^.memory v)
+readOperand' (IndexedY  a) s = let v = (s^.yIndex.to broaden + a)
+                                   c = v^.hi == a^.hi
+                                in delay (2 + if c then 1 else 0) (s^.memory v)
+readOperand' (PreIndexedIndirect a) s = let v = broaden (s^.xIndex + a)
+                                         in delay 4 $ s^.memory (s^.memoryW v)
+readOperand' (PostIndexedIndirect a) s = let v  = s^.memoryW (broaden a)
+                                             v' = v + s^.yIndex.to broaden
+                                             c  = v^.hi == v'^.hi
+                                          in delay (3 + if c then 1 else 0) $ s^.memory v'
+
+writeOperand' :: (MonadWriter Cycles m) => MemOperand -> Word8 -> MachineState -> m (MachineState)
+writeOperand' (Immediate  v) _ = error "Can't write to immediate"
+writeOperand' (ZeroPage   a) v = delay 1 . (memory (broaden a) .~ v)
+writeOperand' (Absolute   a) v = delay 2 . (memory a .~ v)
+writeOperand' (IndexedX   a) v = delay 3 . \s -> s & memory (s^.xIndex.(to broaden) + a) .~ v
+writeOperand' (IndexedY   a) v = delay 3 . \s -> s & memory (s^.yIndex.(to broaden) + a) .~ v
+writeOperand' (ZPIndexedX a) v = delay 2 . \s -> s & memory (broaden $ s^.xIndex + a) .~ v
+writeOperand' (ZPIndexedY a) v = delay 2 . \s -> s & memory (broaden $ s^.yIndex + a) .~ v
+writeOperand' (PreIndexedIndirect a) v
+    = delay 4 . \s -> let a' = s^.memoryW (broaden $ s^.xIndex + a)
+                       in s & memory a' .~ v
+writeOperand' (PostIndexedIndirect a) v
+    = delay 4 . \s -> let a' = s^.memoryW (broaden a) + s^.yIndex.to broaden
+                       in s & memory a' .~ v
+
+newtype Emu a = Emu (WriterT (Sum Int) (State MachineState) a)
+     deriving ( MonadWriter (Sum Int)
+              , MonadState MachineState
+              , Monad
+              , Applicative
+              , Functor
+              )
+
+readOperand :: MemOperand -> Emu Word8
+readOperand o = get >>= readOperand' o
+
+writeOperand :: MemOperand -> Word8 -> Emu ()
+writeOperand o v = get >>= writeOperand' o v >>= put
 
 data MemOperand = Immediate Word8
                 | ZeroPage ZeroPageAddress
@@ -28,160 +130,99 @@ data Instruction = CLC
                  | ADC MemOperand
                  | AND MemOperand
 
-type Cycles = Int
-type Register = WireI Word8 Word8
-type RegisterW = WireI Word16 Word16
-type Carry = Bool
-type SignedOverflow = Bool
-type Address = Word16
-type ZeroPageAddress = Word8
-type StatusBit = Word8
-
-broaden :: Word8 -> Word16
-broaden = fromIntegral
-
-asWord :: Word8 -> Word8 -> Word16
-asWord a b = broaden a .|. shiftL (broaden b) 8
-
-stuff = do
-  memVec <- unsafeNew 65536
-  let ifW' :: a -> a -> WireI Bool a
-      ifW' t e = arr (\x -> if x then t else e)
-
-      cond :: (a -> Bool) -> WireI Bool b -> WireI a a
-      cond a b = preserve $ b . arr a
-
-      preserve :: WireI a b -> WireI a a
-      preserve a = snd <$> (a &&& id)
-
-      accumulator , xindex , yindex , status , sp :: Register
-      accumulator = hold 0 id
-      xindex = hold 0 id
-      yindex = hold 0 id
-      status = hold 0 id
-      sp = hold 0 id
-
-      carry, signedOverflow, zero, negative :: StatusBit
-      carry = 0x01
-      signedOverflow = 0x20
-      zero = 0x02
-      negative = 0x80
-
-      pc :: RegisterW
-      pc = hold 0 id
-
-      -- this is not actually possible, have to fix fetch.
-      opCode :: Word8 -> Instruction
-      opCode = undefined
-
-      -- general type to work with PC too. Can compose directly with the register but
-      -- this means you risk writing to it in complex chains.
-      readRegister :: WireI s s -> WireI a s
-      readRegister r = r . empty
-
-      -- withRegister r f partially applies f to the value in r, producing a wire
-      -- that you can compose.
-      withRegister :: Register -> (Word8 -> Word8 -> Word8) -> WireI Word8 Word8
-      withRegister r f = liftA2 f (readRegister r) id
-
-      -- modify the value in a register
-      modRegister :: Register -> (Word8 -> Word8) -> WireI a Word8
-      modRegister r f = r . (f <$> readRegister r)
-
-      -- A wire that adds the value in a register to its input
-      addRegister :: Register -> WireI Word8 Word8
-      addRegister r = withRegister r (+)
-
-      -- Returns the the register + input and whether such an add crossed a page boundary
-      addRegisterW :: Register -> WireI Word16 (Word16, Bool)
-      addRegisterW r = liftA2 addW (broaden <$> readRegister r) id
-          where addW r a = (r + a, not ((r + a) .&. 0xFF00 == a .&. 0xFF00))
-
-      -- Add a register (presumably the accumulator) with a word8 and a carry bit, giving the sum
-      -- carry bit and signed overflow bit. Used for ADC instruction
-      addRegisterWithCarry :: Register -> WireI (Word8 , Carry) (Word8 , (Carry, SignedOverflow))
-      addRegisterWithCarry r = liftA2 adc (readRegister r) id
-        where adc :: Word8 -> (Word8, Carry) -> (Word8, (Carry, SignedOverflow))
-              adc w1 (w2 , c) = let c' = if c then 1 else 0
-                                    acc = w1 + w2 + c'
-                                    carry = shiftR (broaden w1 + broaden w2 + broaden c') 8 /= 0
-                                    so = ((acc `xor` w1) .&. (w2 `xor` w1) .&. 0x80) /= 0
-                                 in (acc, (carry , so))
-
-      -- Read from memory at a: send (a, Nothing) to memory and the result is the byte at that loc.
-      -- Write v to memory at a: send (a, Just v) to memory and the result is the value you just wrote.
-      memory :: WireI (Address, Maybe Word8) Word8
-      memory = mkFixM (\_ (loc , set) -> maybe (return ()) (write memVec $ fromIntegral loc) set
-                                      >> fmap Right (V.read memVec $ fromIntegral loc))
-
-      -- helper to make reading memory easier.
-      readMemory :: WireI Address Word8
-      readMemory = lmap (,Nothing) memory
-
-      -- Read two contiguous bytes in memory.
-      readWord :: WireI Address Word16
-      readWord = uncurry asWord <$> (readMemory &&& (readMemory . arr (+1)))
-
-      -- Interpret a memory access operand, returning the value and the number of cycles
-      -- that took to read.
-      readOperand :: WireI MemOperand (Word8, Cycles)
-      readOperand = switch (arr readOp) empty
-       where readOp (Immediate  x) = (,2) <$> constant x
-             readOp (ZeroPage   x) = (,3) <$> readMemory . pure (broaden x)
-             readOp (Absolute   x) = (,4) <$> readMemory . pure x
-             readOp (IndexedX   x) = (readMemory *** ifW' 4 5) . addRegisterW xindex . pure x
-             readOp (IndexedY   x) = (readMemory *** ifW' 4 5) . addRegisterW yindex . pure x
-             readOp (ZPIndexedX x) = (,4) <$> readMemory . (broaden <$> addRegister xindex . pure x)
-             readOp (ZPIndexedY x) = (,4) <$> readMemory . (broaden <$> addRegister yindex . pure x)
-             readOp (PreIndexedIndirect  x) = (,6) <$> readMemory
-                                            . readWord
-                                            . (broaden <$> addRegister xindex . pure x)
-             readOp (PostIndexedIndirect x) = (readMemory *** ifW' 5 6)
-                                            . addRegisterW yindex
-                                            . readWord
-                                            . pure (broaden x)
-
-      -- Get a status bit from the status register
-      getBit :: StatusBit -> WireI a Bool
-      getBit b = ((/= 0) <$> (b .&.) <$> readRegister status)
-
-      -- Set/clear a status bit in the status register
-      setBit :: StatusBit -> WireI Bool Word8
-      setBit b = ifW id (modRegister status (.|. b)) (modRegister status (.&. complement b))
-
-      -- The main processor
-      chooseCircuit :: Instruction -> WireI Instruction Cycles
-      chooseCircuit CLC = constant 2 . modRegister status (.&. 0xFE)
-      chooseCircuit NOP = constant 2
-      chooseCircuit (ADC op) = snd <$>
-                               first ( ( cond (== 0) (setBit zero)     -- TODO? decimal mode?
-                                       . cond ((/= 0) . (.&. 0x80)) (setBit negative)
-                                       . accumulator
-                                     *** setBit carry
-                                     *** setBit signedOverflow)
-                                     . addRegisterWithCarry accumulator
-                                     . (id &&& getBit carry)
-                                     )
-                             . readOperand
-                             . pure op
-      chooseCircuit (AND op) = snd <$>
-                               first (accumulator . withRegister accumulator (.&.))
-                             . readOperand . pure op
-
-      -- Todo, read multi byte instructions
-      fetch :: WireI a Instruction
-      fetch = opCode <$> memory . fmap (, Nothing) (readRegister pc)
-
-   in do return () :: IO ()
-         return $ switch (arr chooseCircuit) empty . fetch
 
 
-main :: IO ()
-main =  undefined -- loop secondClock clockSession
-  where
-     loop w' session' = do
-         (mx, w, session) <- stepSessionP w' session' ()
-         case mx of
-           Left ex -> return () -- putStrLn ("Inhibited: " ++ show ex)
-           Right x -> putStrLn ("Produced: " ++ show x)
-         loop w session
+
+bitAsWord8 :: Int -> Prism' Word8 Bool
+bitAsWord8 i = prism' (\x -> if x then B.bit i else 0) (\x -> if | x == 0       -> Just False
+                                                                 | x == B.bit i -> Just True
+                                                                 | otherwise    -> Nothing )
+
+adc :: MemOperand -> Emu ()
+adc o = do a <- use accumulator
+           b <- readOperand o
+           c <- use (status.bitAt carry.re (bitAsWord8 carry))
+           let (hi, lo) = (broaden a + broaden b + broaden c) ^. from combine
+           accumulator .= lo
+           status.bitAt carry .= (hi /= 0)
+           status.bitAt zero .= (lo == 0)
+           status.bitAt negative .= (lo B..&. 0x80 /= 0)
+           status.bitAt signedOverflow .= (B.complement (a `B.xor` b)
+                                                 B..&.(a `B.xor` lo)
+                                                 B..&. 0x80 /= 0)
+
+and :: MemOperand -> Emu ()
+and o = do m <- readOperand o
+           a' <- accumulator <.&.= m
+           status.bitAt zero .= (a' == 0)
+           status.bitAt negative .= (a' B..&. 0x80 /= 0)
+
+aslA :: Emu ()
+aslA = do accumulator %= flip B.rotateL 1
+          c <- use $ accumulator.bitAt 0
+          status.bitAt carry .= c
+          accumulator.bitAt 0 .= False
+
+asl :: MemOperand -> Emu ()
+asl o = do x <- readOperand o
+           let v = B.rotateL x 1
+           status.bitAt carry .= v^.bitAt 0
+           writeOperand o (v & bitAt 0 .~ False)
+
+jmp :: Word16 -> Emu ()
+jmp a = do pc .= a
+           wait 1
+
+jmpi :: Word16 -> Emu ()
+jmpi a = do use (memoryW a) >>= jmp
+            wait 2
+
+branch :: Int8 -> Emu ()
+branch w = do p  <- use pc
+              p' <- pc <+= fromIntegral w
+              wait $ if (p^.hi == p'^.hi) then 1 else 2
+
+
+bcs :: Int8 -> Emu ()
+bcs l = wait 2 >> use (status.bitAt carry) >>= flip when (branch l)
+
+bcc :: Int8 -> Emu ()
+bcc l = wait 2 >> use (status.bitAt carry.to not) >>= flip when (branch l)
+
+beq :: Int8 -> Emu ()
+beq l = wait 2 >> use (status.bitAt zero) >>= flip when (branch l)
+
+bne :: Int8 -> Emu ()
+bne l = wait 2 >> use (status.bitAt zero.to not) >>= flip when (branch l)
+
+bmi :: Int8 -> Emu ()
+bmi l = wait 2 >> use (status.bitAt negative) >>= flip when (branch l)
+
+bpl :: Int8 -> Emu ()
+bpl l = wait 2 >> use (status.bitAt negative.to not) >>= flip when (branch l)
+
+bit :: MemOperand -> Emu ()
+bit (ZeroPage v) = bit (Absolute (broaden v)) >> wait (-1)
+bit (Absolute v) = do x <- use accumulator
+                      x' <- use (memory v)
+                      status.bitAt zero .= (x B..&. x' == 0)
+                      status.bitAt signedOverflow .= (x' ^. bitAt 6)
+                      status.bitAt negative .= (x' ^. bitAt 7)
+                      wait 4
+bit _            = error "bit not defined for anything but absolute addressing"
+
+brk :: Emu ()
+brk = undefined
+
+
+
+carry, signedOverflow, zero, negative :: Int
+carry = 0
+signedOverflow = 6
+interrupt = 4
+disableInterrupt = 2
+decimalMode = 3
+zero = 1
+negative = 7
+
+main = return ()
